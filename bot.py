@@ -1,333 +1,433 @@
 import os
-import json
-import time
-import threading
-import requests as req
-from flask import Flask, render_template, request, Response, jsonify, stream_with_context
+import asyncio
+import discord
+from discord import app_commands
+from discord.ext import commands
+from datetime import datetime
 
-app = Flask(__name__)
+# ─── Config from Environment Variables ─────────────────────────────
+DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+GUILD_ID = os.environ.get("GUILD_ID", "")
+LOG_CHANNEL_ID = os.environ.get("LOG_CHANNEL_ID", "")
+ALLOWED_CHANNEL = os.environ.get("ALLOWED_CHANNEL", "")  # optional: restrict command to this channel
 
-DISCORD_API = "https://discord.com/api/v10"
+# ─── Bot Setup ─────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+intents.guilds = True
 
-# Global stop event for aborting mass DM
-stop_event = threading.Event()
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-
-def discord_fetch(url, bot_token, method="GET", json_body=None):
-    """Helper to call Discord REST API with bot token."""
-    headers = {
-        "Authorization": f"Bot {bot_token}",
-        "Content-Type": "application/json",
-    }
-    try:
-        if method == "GET":
-            r = req.get(url, headers=headers, timeout=30)
-        elif method == "POST":
-            r = req.post(url, headers=headers, json=json_body, timeout=30)
-        elif method == "PATCH":
-            r = req.patch(url, headers=headers, json=json_body, timeout=30)
-        else:
-            return None, None
-
-        if r.status_code == 429:
-            data = r.json()
-            retry_after = data.get("retry_after", 5)
-            return {"rate_limited": True, "retry_after": retry_after}, None
-
-        return None, r
-    except Exception as e:
-        return {"error": str(e)}, None
+# Global state for stopping
+stop_flags = {}
 
 
-def get_all_members(guild_id, bot_token):
-    """Fetch all guild members with pagination."""
-    members = []
-    after = "0"
+# ─── Helpers ───────────────────────────────────────────────────────
 
-    while True:
-        url = f"{DISCORD_API}/guilds/{guild_id}/members?limit=1000&after={after}"
-        err, resp = discord_fetch(url, bot_token)
+def make_progress_embed(title, sent, failed, dm_closed, total, status="in_progress", extra=""):
+    """Create a styled embed for progress updates."""
+    progress = sent + failed + dm_closed
+    pct = int((progress / total) * 100) if total > 0 else 0
 
-        if err and err.get("rate_limited"):
-            time.sleep(err["retry_after"])
-            continue
+    bar_filled = int(pct / 5)
+    bar_empty = 20 - bar_filled
+    bar = "\u2588" * bar_filled + "\u2591" * bar_empty
 
-        if err:
-            raise Exception(err.get("error", "Unknown error"))
+    if status == "in_progress":
+        color = discord.Color.blue()
+        icon = "\U0001f4e8"
+    elif status == "complete":
+        color = discord.Color.green()
+        icon = "\u2705"
+    elif status == "stopped":
+        color = discord.Color.orange()
+        icon = "\u26a0\ufe0f"
+    else:
+        color = discord.Color.red()
+        icon = "\u274c"
 
-        if resp.status_code != 200:
-            raise Exception(f"Failed to fetch members: HTTP {resp.status_code}")
+    embed = discord.Embed(
+        title=f"{icon} {title}",
+        color=color,
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(name="Progress", value=f"`{bar}` {pct}% ({progress}/{total})", inline=False)
+    embed.add_field(name="Sent", value=f"```\n{sent}\n```", inline=True)
+    embed.add_field(name="Failed", value=f"```\n{failed}\n```", inline=True)
+    embed.add_field(name="DM Closed", value=f"```\n{dm_closed}\n```", inline=True)
 
-        batch = resp.json()
-        if not batch:
+    if extra:
+        embed.add_field(name="Info", value=extra, inline=False)
+
+    embed.set_footer(text="Discord Mass DM Bot")
+    return embed
+
+
+async def send_mass_dm(interaction, message_text, mode, role_ids, delay_sec):
+    """Core logic: send DMs to guild members with live progress."""
+    guild = bot.get_guild(int(GUILD_ID))
+    if not guild:
+        await interaction.followup.send("\u274c Cannot find the guild. Check `GUILD_ID`.", ephemeral=True)
+        return
+
+    session_id = str(interaction.user.id)
+    stop_flags[session_id] = False
+
+    # Fetch all members
+    await interaction.followup.send("\u23f3 Fetching server members...", ephemeral=True)
+    members = [m for m in guild.members if not m.bot]
+
+    # Filter by roles
+    if mode == "roles" and role_ids:
+        members = [m for m in members if any(str(r.id) in role_ids for r in m.roles)]
+
+    total = len(members)
+    if total == 0:
+        await interaction.followup.send("\u274c No members found matching criteria.", ephemeral=True)
+        return
+
+    # Send initial progress to log channel
+    log_channel = None
+    if LOG_CHANNEL_ID:
+        log_channel = bot.get_channel(int(LOG_CHANNEL_ID))
+
+    embed = make_progress_embed("Mass DM Started", 0, 0, 0, total)
+    progress_msg = None
+    if log_channel:
+        progress_msg = await log_channel.send(embed=embed)
+
+    # Also send progress in the command channel
+    cmd_progress_msg = await interaction.followup.send(embed=embed, wait=True)
+
+    sent = 0
+    failed = 0
+    dm_closed = 0
+
+    for i, member in enumerate(members):
+        if stop_flags.get(session_id, False):
             break
 
-        members.extend(batch)
-        after = batch[-1]["user"]["id"]
-
-        if len(batch) < 1000:
-            break
-
-    return members
-
-
-def send_status_message(channel_id, bot_token, content):
-    """Send a message to a Discord channel, return message ID."""
-    url = f"{DISCORD_API}/channels/{channel_id}/messages"
-    err, resp = discord_fetch(url, bot_token, method="POST", json_body={"content": content})
-    if err or not resp or resp.status_code != 200:
-        return None
-    return resp.json().get("id")
-
-
-def edit_status_message(channel_id, message_id, bot_token, content):
-    """Edit an existing Discord message."""
-    url = f"{DISCORD_API}/channels/{channel_id}/messages/{message_id}"
-    discord_fetch(url, bot_token, method="PATCH", json_body={"content": content})
-
-
-# ─── Routes ───────────────────────────────────────────────────────
-
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-
-@app.route("/api/guild-info", methods=["POST"])
-def guild_info():
-    data = request.get_json()
-    bot_token = data.get("botToken", "")
-    guild_id = data.get("guildId", "")
-
-    if not bot_token or not guild_id:
-        return jsonify({"error": "Missing botToken or guildId"}), 400
-
-    url = f"{DISCORD_API}/guilds/{guild_id}?with_counts=true"
-    err, resp = discord_fetch(url, bot_token)
-
-    if err:
-        if err.get("rate_limited"):
-            return jsonify({"error": "Rate limited, try again later"}), 429
-        return jsonify({"error": err.get("error", "Unknown error")}), 500
-
-    if resp.status_code != 200:
-        return jsonify({"error": f"Discord API error: {resp.status_code}"}), resp.status_code
-
-    guild = resp.json()
-    icon_url = None
-    if guild.get("icon"):
-        ext = "gif" if guild["icon"].startswith("a_") else "png"
-        icon_url = f"https://cdn.discordapp.com/icons/{guild['id']}/{guild['icon']}.{ext}?size=128"
-
-    return jsonify({
-        "id": guild["id"],
-        "name": guild["name"],
-        "icon": icon_url,
-        "memberCount": guild.get("approximate_member_count", 0),
-        "onlineCount": guild.get("approximate_presence_count", 0),
-    })
-
-
-@app.route("/api/roles", methods=["POST"])
-def roles():
-    data = request.get_json()
-    bot_token = data.get("botToken", "")
-    guild_id = data.get("guildId", "")
-
-    if not bot_token or not guild_id:
-        return jsonify({"error": "Missing botToken or guildId"}), 400
-
-    url = f"{DISCORD_API}/guilds/{guild_id}/roles"
-    err, resp = discord_fetch(url, bot_token)
-
-    if err:
-        if err.get("rate_limited"):
-            return jsonify({"error": "Rate limited"}), 429
-        return jsonify({"error": err.get("error", "Unknown error")}), 500
-
-    if resp.status_code != 200:
-        return jsonify({"error": f"Discord API error: {resp.status_code}"}), resp.status_code
-
-    all_roles = resp.json()
-    # Filter out @everyone, sort by position descending
-    filtered = [
-        {
-            "id": r["id"],
-            "name": r["name"],
-            "color": f"#{r['color']:06x}" if r.get("color", 0) != 0 else None,
-            "position": r["position"],
-            "managed": r.get("managed", False),
-        }
-        for r in all_roles
-        if r["name"] != "@everyone"
-    ]
-    filtered.sort(key=lambda x: x["position"], reverse=True)
-
-    return jsonify(filtered)
-
-
-@app.route("/api/stop", methods=["POST"])
-def stop():
-    stop_event.set()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/send-dm", methods=["POST"])
-def send_dm():
-    data = request.get_json()
-    bot_token = data.get("botToken", "")
-    guild_id = data.get("guildId", "")
-    message = data.get("message", "")
-    mode = data.get("mode", "all")
-    role_ids = data.get("roleIds", [])
-    delay_sec = data.get("delay", 2)
-    status_channel_id = data.get("statusChannelId")
-
-    stop_event.clear()
-
-    def generate():
-        def sse(event_type, payload):
-            return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+        display_name = member.display_name
+        final_message = message_text.replace("<user>", member.mention)
 
         try:
-            # Step 1: Fetch all members
-            yield sse("log", {"status": "info", "message": "Fetching server members..."})
-
-            try:
-                members = get_all_members(guild_id, bot_token)
-            except Exception as e:
-                yield sse("error", {"message": f"Failed to fetch members: {str(e)}"})
-                return
-
-            # Step 2: Filter out bots
-            members = [m for m in members if not m.get("user", {}).get("bot", False)]
-
-            # Step 3: Filter by roles if needed
-            if mode == "roles" and role_ids:
-                members = [
-                    m for m in members
-                    if any(r in role_ids for r in m.get("roles", []))
-                ]
-
-            total = len(members)
-            yield sse("log", {"status": "info", "message": f"Found {total} members to message"})
-            yield sse("progress", {"sent": 0, "failed": 0, "total": total, "dmClosed": 0})
-
-            if total == 0:
-                yield sse("complete", {"sent": 0, "failed": 0, "total": 0, "dmClosed": 0})
-                return
-
-            # Step 4: Send initial status message to Discord channel
-            status_message_id = None
-            if status_channel_id:
-                status_message_id = send_status_message(
-                    status_channel_id,
-                    bot_token,
-                    f"**Mass DM Started**\nProgress: 0/{total} members\nSuccess: 0 | Failed: 0",
-                )
-
-            sent = 0
-            failed = 0
-            dm_closed = 0
-
-            # Step 5: Send DMs
-            for i, member in enumerate(members):
-                # Check stop
-                if stop_event.is_set():
-                    yield sse("log", {"status": "info", "message": "Stopped by user"})
-                    break
-
-                user = member.get("user", {})
-                display_name = user.get("global_name") or user.get("username", "Unknown")
-
+            dm_channel = await member.create_dm()
+            await dm_channel.send(final_message)
+            sent += 1
+            status_text = f"\u2705 Sent to **{display_name}**"
+        except discord.Forbidden:
+            dm_closed += 1
+            status_text = f"\U0001f512 {display_name} - DMs disabled"
+        except discord.HTTPException as e:
+            if e.status == 429:
+                retry_after = e.retry_after if hasattr(e, "retry_after") else 5
+                status_text = f"\u23f1\ufe0f Rate limited! Waiting {retry_after}s..."
+                if log_channel:
+                    await log_channel.send(f"\u23f1\ufe0f Rate limited! Waiting {retry_after}s...")
+                await asyncio.sleep(retry_after)
+                # Retry once
                 try:
-                    # Create DM channel
-                    dm_url = f"{DISCORD_API}/users/@me/channels"
-                    err, resp = discord_fetch(dm_url, bot_token, method="POST", json_body={"recipient_id": user["id"]})
-
-                    # Handle rate limit
-                    if err and err.get("rate_limited"):
-                        wait_time = err["retry_after"]
-                        yield sse("log", {"status": "ratelimit", "message": f"Rate limited! Waiting {wait_time}s..."})
-                        time.sleep(wait_time)
-                        err, resp = discord_fetch(dm_url, bot_token, method="POST", json_body={"recipient_id": user["id"]})
-
-                    if err or not resp or resp.status_code != 200:
-                        raise Exception("Cannot create DM channel")
-
-                    dm_channel = resp.json()
-
-                    # Replace <user> placeholder
-                    final_message = message.replace("<user>", f"<@{user['id']}>")
-
-                    # Send message
-                    msg_url = f"{DISCORD_API}/channels/{dm_channel['id']}/messages"
-                    err, resp = discord_fetch(msg_url, bot_token, method="POST", json_body={"content": final_message})
-
-                    # Handle rate limit
-                    if err and err.get("rate_limited"):
-                        wait_time = err["retry_after"]
-                        yield sse("log", {"status": "ratelimit", "message": f"Rate limited! Waiting {wait_time}s..."})
-                        time.sleep(wait_time)
-                        err, resp = discord_fetch(msg_url, bot_token, method="POST", json_body={"content": final_message})
-
-                    if resp and resp.status_code == 200:
-                        sent += 1
-                        yield sse("log", {"status": "success", "message": f"Sent to {display_name}"})
-                    elif resp and resp.status_code == 403:
-                        dm_closed += 1
-                        yield sse("log", {"status": "dm_closed", "message": f"{display_name} - DMs disabled"})
-                    else:
-                        status_code = resp.status_code if resp else "N/A"
-                        failed += 1
-                        yield sse("log", {"status": "failed", "message": f"Failed: {display_name} ({status_code})"})
-
+                    await dm_channel.send(final_message)
+                    sent += 1
+                    status_text = f"\u2705 Sent to **{display_name}** (after retry)"
                 except Exception:
                     failed += 1
-                    yield sse("log", {"status": "failed", "message": f"Failed: {display_name} - Error"})
+                    status_text = f"\u274c Failed: **{display_name}** (after retry)"
+            else:
+                failed += 1
+                status_text = f"\u274c Failed: **{display_name}** ({e.status})"
+        except Exception:
+            failed += 1
+            status_text = f"\u274c Failed: **{display_name}** - Error"
 
-                yield sse("progress", {"sent": sent, "failed": failed, "total": total, "dmClosed": dm_closed})
+        # Log each DM result to log channel
+        if log_channel and (i + 1) % 3 == 0:
+            await log_channel.send(status_text)
 
-                # Update status message in Discord channel every 5 members
-                if status_channel_id and status_message_id and (i + 1) % 5 == 0:
-                    progress = sent + failed + dm_closed
-                    edit_status_message(
-                        status_channel_id,
-                        status_message_id,
-                        bot_token,
-                        f"**Mass DM In Progress...**\nProgress: {progress}/{total} members\nSuccess: {sent} | Failed: {failed} | DM Closed: {dm_closed}",
-                    )
+        # Update progress embed every 5 members or on last member
+        if (i + 1) % 5 == 0 or (i + 1) == total:
+            embed = make_progress_embed("Mass DM In Progress...", sent, failed, dm_closed, total)
+            try:
+                if progress_msg:
+                    await progress_msg.edit(embed=embed)
+                await cmd_progress_msg.edit(embed=embed)
+            except Exception:
+                pass
 
-                # Delay between messages
-                if i < len(members) - 1 and not stop_event.is_set():
-                    time.sleep(delay_sec)
+        # Delay
+        if i < len(members) - 1 and not stop_flags.get(session_id, False):
+            await asyncio.sleep(delay_sec)
 
-            # Final status message update
-            if status_channel_id and status_message_id:
-                progress = sent + failed + dm_closed
-                edit_status_message(
-                    status_channel_id,
-                    status_message_id,
-                    bot_token,
-                    f"**Mass DM Complete!**\nTotal: {progress}/{total} members\nSuccess: {sent} | Failed: {failed} | DM Closed: {dm_closed}",
-                )
+    # Final update
+    was_stopped = stop_flags.get(session_id, False)
+    status = "stopped" if was_stopped else "complete"
+    title = "Mass DM Stopped" if was_stopped else "Mass DM Complete!"
 
-            yield sse("complete", {"sent": sent, "failed": failed, "total": total, "dmClosed": dm_closed})
+    embed = make_progress_embed(title, sent, failed, dm_closed, total, status=status)
+    try:
+        if progress_msg:
+            await progress_msg.edit(embed=embed)
+        await cmd_progress_msg.edit(embed=embed)
+    except Exception:
+        pass
 
-        except Exception as e:
-            yield sse("error", {"message": f"Unexpected error: {str(e)}"})
+    if log_channel:
+        summary = (
+            f"**{'Stopped' if was_stopped else 'Complete'}!** "
+            f"Sent: {sent} | Failed: {failed} | DM Closed: {dm_closed} | Total: {total}"
+        )
+        await log_channel.send(summary)
 
-    return Response(
-        stream_with_context(generate()),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+    stop_flags.pop(session_id, None)
+
+
+# ─── Views (Buttons & Modals) ─────────────────────────────────────
+
+class MessageModal(discord.ui.Modal, title="Type Your Message"):
+    """Modal that pops up to let user type the DM message."""
+
+    message_input = discord.ui.TextInput(
+        label="Message",
+        style=discord.TextStyle.paragraph,
+        placeholder="Type your message here... Use <user> to mention each user",
+        required=True,
+        max_length=2000,
     )
 
+    delay_input = discord.ui.TextInput(
+        label="Delay (seconds between each DM)",
+        style=discord.TextStyle.short,
+        placeholder="2",
+        required=False,
+        default="2",
+        max_length=5,
+    )
+
+    def __init__(self, mode, role_ids=None):
+        super().__init__()
+        self.mode = mode
+        self.role_ids = role_ids or []
+
+    async def on_submit(self, interaction: discord.Interaction):
+        message_text = self.message_input.value
+        try:
+            delay_sec = float(self.delay_input.value or "2")
+            delay_sec = max(0.5, min(delay_sec, 30))
+        except ValueError:
+            delay_sec = 2.0
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Run mass DM in background
+        asyncio.create_task(
+            send_mass_dm(interaction, message_text, self.mode, self.role_ids, delay_sec)
+        )
+
+
+class RoleSelectView(discord.ui.View):
+    """View with role select menu + confirm button."""
+
+    def __init__(self, guild: discord.Guild):
+        super().__init__(timeout=120)
+        self.selected_role_ids = []
+
+        # Add role select
+        roles = [r for r in guild.roles if r.name != "@everyone" and not r.managed]
+        roles.sort(key=lambda r: r.position, reverse=True)
+
+        # Discord allows max 25 options
+        options = []
+        for r in roles[:25]:
+            options.append(
+                discord.SelectOption(
+                    label=r.name,
+                    value=str(r.id),
+                    description=f"Members: {len(r.members)}",
+                )
+            )
+
+        if options:
+            select = discord.ui.Select(
+                placeholder="Select roles...",
+                min_values=1,
+                max_values=min(len(options), 25),
+                options=options,
+            )
+            select.callback = self.role_select_callback
+            self.add_item(select)
+
+    async def role_select_callback(self, interaction: discord.Interaction):
+        self.selected_role_ids = interaction.data.get("values", [])
+        role_names = []
+        guild = bot.get_guild(int(GUILD_ID))
+        if guild:
+            for rid in self.selected_role_ids:
+                role = guild.get_role(int(rid))
+                if role:
+                    role_names.append(role.name)
+        await interaction.response.send_message(
+            f"Selected roles: **{', '.join(role_names)}**\nNow click **Confirm & Type Message** below.",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="Confirm & Type Message", style=discord.ButtonStyle.green, row=2)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.selected_role_ids:
+            await interaction.response.send_message("Please select at least one role first!", ephemeral=True)
+            return
+        modal = MessageModal(mode="roles", role_ids=self.selected_role_ids)
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.grey, row=2)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="Cancelled.", embed=None, view=None)
+
+
+class MainMenuView(discord.ui.View):
+    """Main control panel with Send to All / Send to Roles / Stop buttons."""
+
+    def __init__(self):
+        super().__init__(timeout=300)
+
+    @discord.ui.button(label="Send to All Members", style=discord.ButtonStyle.blurple, emoji="\U0001f4e8")
+    async def send_all_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = MessageModal(mode="all")
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="Send to Specific Roles", style=discord.ButtonStyle.green, emoji="\U0001f3ad")
+    async def send_roles_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = bot.get_guild(int(GUILD_ID))
+        if not guild:
+            await interaction.response.send_message("\u274c Cannot find guild.", ephemeral=True)
+            return
+
+        view = RoleSelectView(guild)
+        embed = discord.Embed(
+            title="\U0001f3ad Select Roles",
+            description="Choose which roles to send the message to, then click **Confirm & Type Message**.",
+            color=discord.Color.green(),
+        )
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+    @discord.ui.button(label="Stop Sending", style=discord.ButtonStyle.red, emoji="\u23f9\ufe0f")
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        session_id = str(interaction.user.id)
+        if session_id in stop_flags:
+            stop_flags[session_id] = True
+            await interaction.response.send_message("\u23f9\ufe0f Stopping mass DM...", ephemeral=True)
+        else:
+            await interaction.response.send_message("No active DM session found.", ephemeral=True)
+
+
+# ─── Slash Command ─────────────────────────────────────────────────
+
+@bot.tree.command(name="massdm", description="Open the Mass DM control panel")
+async def massdm_command(interaction: discord.Interaction):
+    # Check allowed channel
+    if ALLOWED_CHANNEL and str(interaction.channel_id) != ALLOWED_CHANNEL:
+        await interaction.response.send_message(
+            f"\u274c This command can only be used in <#{ALLOWED_CHANNEL}>.",
+            ephemeral=True,
+        )
+        return
+
+    # Check permissions (only admins)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "\u274c You need Administrator permission to use this.",
+            ephemeral=True,
+        )
+        return
+
+    guild = bot.get_guild(int(GUILD_ID))
+    member_count = len([m for m in guild.members if not m.bot]) if guild else 0
+
+    embed = discord.Embed(
+        title="\U0001f4ec Discord Mass DM Panel",
+        description="Choose an action below to send direct messages to server members.",
+        color=discord.Color.from_str("#5865F2"),
+        timestamp=datetime.utcnow(),
+    )
+    embed.add_field(
+        name="\U0001f4ca Server Info",
+        value=(
+            f"**Server:** {guild.name if guild else 'N/A'}\n"
+            f"**Members (non-bot):** {member_count}\n"
+            f"**Log Channel:** {'<#' + LOG_CHANNEL_ID + '>' if LOG_CHANNEL_ID else 'Not set'}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001f4dd Tips",
+        value=(
+            "- Use `<user>` in your message to mention each recipient\n"
+            "- Set delay between 0.5-30 seconds to avoid rate limits\n"
+            "- Click **Stop** to abort at any time"
+        ),
+        inline=False,
+    )
+    if guild and guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    embed.set_footer(text=f"Requested by {interaction.user.display_name}")
+
+    view = MainMenuView()
+    await interaction.response.send_message(embed=embed, view=view)
+
+
+# ─── Bot Events ────────────────────────────────────────────────────
+
+@bot.event
+async def on_ready():
+    print(f"{'='*50}")
+    print(f"  Bot is online: {bot.user} (ID: {bot.user.id})")
+    print(f"  Guild ID: {GUILD_ID}")
+    print(f"  Log Channel: {LOG_CHANNEL_ID or 'Not set'}")
+    print(f"  Allowed Channel: {ALLOWED_CHANNEL or 'Any'}")
+    print(f"{'='*50}")
+
+    # Sync slash commands
+    try:
+        if GUILD_ID:
+            guild_obj = discord.Object(id=int(GUILD_ID))
+            bot.tree.copy_global_to(guild=guild_obj)
+            synced = await bot.tree.sync(guild=guild_obj)
+        else:
+            synced = await bot.tree.sync()
+        print(f"  Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"  Failed to sync commands: {e}")
+
+    # Set status
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.watching,
+            name="/massdm | Mass DM Panel"
+        )
+    )
+
+    # Send startup message to log channel
+    if LOG_CHANNEL_ID:
+        channel = bot.get_channel(int(LOG_CHANNEL_ID))
+        if channel:
+            embed = discord.Embed(
+                title="\U0001f7e2 Bot Online",
+                description=f"Mass DM Bot is ready!\nUse `/massdm` to open the control panel.",
+                color=discord.Color.green(),
+                timestamp=datetime.utcnow(),
+            )
+            await channel.send(embed=embed)
+
+
+# ─── Run ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    if not DISCORD_BOT_TOKEN:
+        print("ERROR: DISCORD_BOT_TOKEN is not set!")
+        exit(1)
+    if not GUILD_ID:
+        print("ERROR: GUILD_ID is not set!")
+        exit(1)
+
+    bot.run(DISCORD_BOT_TOKEN)

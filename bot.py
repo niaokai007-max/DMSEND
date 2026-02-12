@@ -422,12 +422,18 @@ async def on_ready():
 
 # ─── Run ───────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
-    if not DISCORD_BOT_TOKEN:
-        print("ERROR: DISCORD_BOT_TOKEN is not set!")
-        exit(1)
-    if not GUILD_ID:
-        print("ERROR: GUILD_ID is not set!")
-        exit(1)
+if not DISCORD_BOT_TOKEN:
+    print("ERROR: DISCORD_BOT_TOKEN is not set!")
+    print("Please set it in Railway Variables tab.")
+    exit(1)
+if not GUILD_ID:
+    print("ERROR: GUILD_ID is not set!")
+    print("Please set it in Railway Variables tab.")
+    exit(1)
 
-    bot.run(DISCORD_BOT_TOKEN)
+print(f"Starting bot...")
+print(f"GUILD_ID: {GUILD_ID}")
+print(f"LOG_CHANNEL_ID: {LOG_CHANNEL_ID or 'Not set'}")
+print(f"ALLOWED_CHANNEL: {ALLOWED_CHANNEL or 'Not set (all channels)'}")
+
+bot.run(DISCORD_BOT_TOKEN)
